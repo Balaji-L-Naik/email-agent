@@ -32,7 +32,7 @@ BANNER = Text.assemble(
 )
 
 SUBTITLE = Text(
-    "Local · Private · Powered by Ollama  ×  Gmail API",
+    "Local · Private · Email Agent",
     style="dim",
     justify="center",
 )
