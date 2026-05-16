@@ -6,14 +6,14 @@ This agent runs directly from your terminal and allows you to manage your Gmail 
 
 ---
 
-## ✨ Features
+## Features
 
-- **🔍 Search & List:** Ask the agent to find specific emails (e.g., *"Find my unread emails from Google"*). The agent translates this into valid Gmail search queries under the hood.
-- **📖 Read:** Read the full body of any email directly in your terminal.
-- **📝 Summarize:** Too long, didn't read? Ask the agent to summarize specific emails or your top 5 unread messages.
-- **🚀 Send:** Compose and send emails using natural language. The agent will ask for any missing fields (To, Subject, Body) and will **always ask for your confirmation** before dispatching.
-- **🗑️ Delete/Trash:** Keep your inbox clean by asking the agent to delete specific emails or bulk-delete spam based on your descriptions (e.g., *"Delete all emails from newsletters@spam.com"*).
-- **🎨 Beautiful CLI:** Built with `Typer` and `Rich` for styled panels, interactive spinners, and a clean reading experience.
+- **Search & List:** Ask the agent to find specific emails (e.g., *"Find my unread emails from Google"*). The agent translates this into valid Gmail search queries under the hood.
+- **Read:** Read the full body of any email directly in your terminal.
+- **Summarize:** Too long, didn't read? Ask the agent to summarize specific emails or your top 5 unread messages.
+- **Send:** Compose and send emails using natural language. The agent will ask for any missing fields (To, Subject, Body) and will **always ask for your confirmation** before dispatching.
+- **Delete/Trash:** Keep your inbox clean by asking the agent to delete specific emails or bulk-delete spam based on your descriptions (e.g., *"Delete all emails from newsletters@spam.com"*).
+- **Beautiful CLI:** Built with `Typer` and `Rich` for styled panels, interactive spinners, and a clean reading experience.
 
 ---
 
@@ -26,7 +26,7 @@ This agent runs directly from your terminal and allows you to manage your Gmail 
 
 ---
 
-## 🚀 Setup & Installation
+## Setup & Installation
 
 ### 1. Prerequisites
 - Python 3.10+
@@ -64,7 +64,7 @@ pip install -r requirements.txt
 
 ---
 
-## 💻 Usage
+## Usage
 
 Start the agent by running:
 
