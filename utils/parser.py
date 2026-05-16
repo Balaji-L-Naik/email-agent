@@ -23,6 +23,31 @@ def extract_email_body(payload: dict) -> str:
     return "(No readable content)"
 
 
+def extract_attachments(payload: dict) -> list[dict]:
+    """Recursively extract attachment metadata from a Gmail message payload."""
+    attachments = []
+    if "parts" in payload:
+        for part in payload["parts"]:
+            # If it has a filename and body.attachmentId, it's an attachment
+            filename = part.get("filename", "")
+            attachment_id = part.get("body", {}).get("attachmentId")
+            
+            if filename and attachment_id:
+                attachments.append({
+                    "filename": filename,
+                    "mimeType": part.get("mimeType", ""),
+                    "attachmentId": attachment_id,
+                    "size": part.get("body", {}).get("size", 0)
+                })
+                
+            # Recurse into nested multipart
+            mime_type = part.get("mimeType", "")
+            if mime_type.startswith("multipart"):
+                attachments.extend(extract_attachments(part))
+                
+    return attachments
+
+
 def extract_headers(message: dict) -> dict:
     """Return a dict with subject, from_addr, and date from a Gmail message."""
     headers = message.get("payload", {}).get("headers", [])

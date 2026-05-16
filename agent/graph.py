@@ -64,14 +64,16 @@ Given the user's latest message and the conversation so far, output EXACTLY one 
   summarize
   send
   delete
+  label
   converse
 
 Rules:
 - list_search  : user wants to list or search for emails
-- read         : user wants to read / open a specific email
+- read         : user wants to read / open a specific email (or download attachments)
 - summarize    : user wants a summary of one or more emails
 - send         : user wants to compose or send an email
 - delete       : user wants to delete or trash emails (e.g. spam)
+- label        : user wants to archive, star, or mark emails as read/unread
 - converse     : anything else (greeting, question, help, etc.)
 """
 
@@ -95,10 +97,10 @@ Do NOT invent any information not present in the emails.
 """
 
 EXTRACT_SEND_SYSTEM = """You are an email field extractor.
-From the user's instruction extract: recipient email (to), subject, and body.
+From the user's instruction extract: recipient email (to), subject, body, and an array of absolute file paths for attachments.
 Output ONLY valid JSON like:
-{"to": "...", "subject": "...", "body": "..."}
-Use null for any field the user did not mention.
+{"to": "...", "subject": "...", "body": "...", "attachments": ["/path/to/file1.pdf"]}
+Use null or an empty list for any field the user did not mention.
 """
 
 # ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ def classify_intent(state: AgentState) -> AgentState:
     ])
     raw = resp.content.strip().lower()
 
-    valid = {"list_search", "read", "summarize", "send", "delete", "converse"}
+    valid = {"list_search", "read", "summarize", "send", "delete", "label", "converse"}
     intent = raw if raw in valid else "converse"
     return {**state, "intent": intent}
 
@@ -191,12 +193,25 @@ def handle_read(state: AgentState) -> AgentState:
     except RuntimeError as e:
         return {**state, "response": f"⚠ Could not fetch email: {e}"}
 
+    att_text = ""
+    if full.get("attachments"):
+        att_text = "\n\n[bold]Attachments:[/bold]\n"
+        for att in full["attachments"]:
+            att_text += f"📎 {att['filename']} ({att['size']} bytes)\n"
+            if "download" in last_human.lower():
+                try:
+                    from gmail.tools import download_attachment
+                    path = download_attachment(emails[idx]["id"], att["attachmentId"], att["filename"], "./downloads")
+                    att_text += f"   ✅ Downloaded to: {path}\n"
+                except Exception as e:
+                    att_text += f"   ⚠ Failed to download: {e}\n"
+
     response = (
         f"[bold]Subject:[/bold] {full['subject']}\n"
         f"[bold]From:[/bold]    {full['from_addr']}\n"
         f"[bold]Date:[/bold]    {full['date']}\n"
         f"{'─' * 60}\n"
-        f"{full['body']}"
+        f"{full['body']}{att_text}"
     )
     return {
         **state,
@@ -228,8 +243,21 @@ def handle_summarize(state: AgentState) -> AgentState:
     for em in emails[:count]:
         try:
             full = get_email_body(em["id"])
+            body_text = full['body']
+            
+            # Read attachment text if present
+            if full.get("attachments"):
+                for att in full["attachments"]:
+                    if att["mimeType"] in ["text/plain", "text/csv", "application/pdf"]:
+                        try:
+                            from gmail.tools import read_text_attachment
+                            att_text = read_text_attachment(em["id"], att["attachmentId"], att["mimeType"])
+                            body_text += f"\n\n[Attachment: {att['filename']}]\n{att_text}"
+                        except Exception:
+                            pass
+
             parts.append(
-                f"--- Email from {full['from_addr']} | {full['subject']} ---\n{full['body']}"
+                f"--- Email from {full['from_addr']} | {full['subject']} ---\n{body_text}"
             )
         except RuntimeError:
             parts.append(f"--- Email (could not fetch body): {em['subject']} ---")
@@ -268,7 +296,7 @@ def handle_send(state: AgentState) -> AgentState:
         lower = last_human.lower().strip()
         if any(w in lower for w in confirmation_words):
             try:
-                msg_id = send_email(pending["to"], pending["subject"], pending["body"])
+                msg_id = send_email(pending["to"], pending["subject"], pending["body"], pending.get("attachments", []))
                 return {
                     **state,
                     "pending_send": None,
@@ -304,30 +332,35 @@ def handle_send(state: AgentState) -> AgentState:
     to = fields.get("to") or pending.get("to")
     subject = fields.get("subject") or pending.get("subject")
     body = fields.get("body") or pending.get("body")
+    attachments = fields.get("attachments") or pending.get("attachments") or []
 
     # Ask for any missing field
     if not to:
-        return {**state, "pending_send": {**pending, "subject": subject, "body": body},
+        return {**state, "pending_send": {**pending, "subject": subject, "body": body, "attachments": attachments},
                 "response": "Who should I send this to? (Please provide the recipient's email address)"}
     if not subject:
-        return {**state, "pending_send": {**pending, "to": to, "body": body},
+        return {**state, "pending_send": {**pending, "to": to, "body": body, "attachments": attachments},
                 "response": "What should the subject line be?"}
     if not body:
-        return {**state, "pending_send": {**pending, "to": to, "subject": subject},
+        return {**state, "pending_send": {**pending, "to": to, "subject": subject, "attachments": attachments},
                 "response": "What should the body of the email say?"}
 
     # All fields present — show preview and ask for confirmation
+    att_preview = ""
+    if attachments:
+        att_preview = f"[bold]Attachments:[/bold] {', '.join(attachments)}\n"
+
     preview = (
         f"[bold]To:[/bold]      {to}\n"
         f"[bold]Subject:[/bold] {subject}\n"
-        f"{'─' * 50}\n"
+        f"{att_preview}{'─' * 50}\n"
         f"{body}\n"
         f"{'─' * 50}\n"
         f"Reply [bold green]yes[/bold green] to send, or [bold red]no[/bold red] to cancel."
     )
     return {
         **state,
-        "pending_send": {"to": to, "subject": subject, "body": body, "awaiting_confirm": True},
+        "pending_send": {"to": to, "subject": subject, "body": body, "attachments": attachments, "awaiting_confirm": True},
         "response": preview,
         "messages": state["messages"] + [AIMessage(content=preview)],
     }
@@ -421,6 +454,56 @@ def handle_delete(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
+# Node: label email
+# ---------------------------------------------------------------------------
+
+def handle_label(state: AgentState) -> AgentState:
+    history = state["messages"]
+    last_human = next(
+        (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
+    ).lower()
+    emails = state.get("emails", [])
+
+    if not emails:
+        return {**state, "response": "Please list or search emails first so I know which one to label."}
+
+    numbers = re.findall(r"\b(\d+)\b", last_human)
+    idx = int(numbers[0]) - 1 if numbers else 0
+
+    if idx < 0 or idx >= len(emails):
+        return {**state, "response": f"Please specify a valid email number (1-{len(emails)})."}
+
+    msg_id = emails[idx]["id"]
+    
+    add_labels = []
+    remove_labels = []
+    
+    if "read" in last_human and ("mark" in last_human or "as" in last_human):
+        remove_labels.append("UNREAD")
+    if "unread" in last_human:
+        add_labels.append("UNREAD")
+    if "archive" in last_human:
+        remove_labels.append("INBOX")
+    if "star" in last_human and "unstar" not in last_human:
+        add_labels.append("STARRED")
+    if "unstar" in last_human:
+        remove_labels.append("STARRED")
+        
+    if not add_labels and not remove_labels:
+        return {**state, "response": "I couldn't understand what label action to take. (Try 'archive email 1' or 'mark email 2 as read')"}
+        
+    try:
+        from gmail.tools import modify_message_labels
+        modify_message_labels(msg_id, add_labels, remove_labels)
+        
+        # update the local emails state snippet if they changed UNREAD
+        new_emails = list(emails)
+        return {**state, "emails": new_emails, "response": "✅ Labels updated successfully."}
+    except Exception as e:
+        return {**state, "response": f"⚠ Failed to update labels: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Node: general conversation
 # ---------------------------------------------------------------------------
 
@@ -459,6 +542,7 @@ def router(state: AgentState) -> str:
         "summarize": "handle_summarize",
         "send": "handle_send",
         "delete": "handle_delete",
+        "label": "handle_label",
         "converse": "handle_converse",
     }
     return mapping.get(intent, "handle_converse")
@@ -477,6 +561,7 @@ def build_graph() -> StateGraph:
     g.add_node("handle_summarize", handle_summarize)
     g.add_node("handle_send", handle_send)
     g.add_node("handle_delete", handle_delete)
+    g.add_node("handle_label", handle_label)
     g.add_node("handle_converse", handle_converse)
 
     g.set_entry_point("classify_intent")
@@ -490,12 +575,13 @@ def build_graph() -> StateGraph:
             "handle_summarize": "handle_summarize",
             "handle_send": "handle_send",
             "handle_delete": "handle_delete",
+            "handle_label": "handle_label",
             "handle_converse": "handle_converse",
         },
     )
 
     for node in ["handle_list_search", "handle_read", "handle_summarize",
-                 "handle_send", "handle_delete", "handle_converse"]:
+                 "handle_send", "handle_delete", "handle_label", "handle_converse"]:
         g.add_edge(node, END)
 
     return g.compile()

@@ -85,8 +85,11 @@ def get_email_body(msg_id: str) -> dict:
     except Exception as exc:
         raise RuntimeError(f"Gmail API error fetching message {msg_id}: {exc}") from exc
 
+    from utils.parser import extract_attachments
     headers = extract_headers(full)
-    body = extract_email_body(full.get("payload", {}))
+    payload = full.get("payload", {})
+    body = extract_email_body(payload)
+    attachments = extract_attachments(payload)
 
     return {
         "id": msg_id,
@@ -94,18 +97,44 @@ def get_email_body(msg_id: str) -> dict:
         "from_addr": headers["from_addr"],
         "date": headers["date"],
         "body": body,
+        "attachments": attachments
     }
 
 
-def send_email(to: str, subject: str, body: str) -> str:
-    """
-    Send an email via the authenticated Gmail account.
+import os
+import mimetypes
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
-    Returns the sent message ID on success.
-    Raises RuntimeError on failure.
+def send_email(to: str, subject: str, body: str, attachments: list[str] = None) -> str:
+    """
+    Send an email via the authenticated Gmail account, with optional attachments.
     """
     service = _get_service()
-    mime = MIMEText(body)
+    
+    if not attachments:
+        mime = MIMEText(body)
+    else:
+        mime = MIMEMultipart()
+        mime.attach(MIMEText(body))
+        
+        for file_path in attachments:
+            if not os.path.exists(file_path):
+                continue
+            ctype, encoding = mimetypes.guess_type(file_path)
+            if ctype is None or encoding is not None:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            
+            with open(file_path, "rb") as f:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(f.read())
+            
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(file_path)}"')
+            mime.attach(part)
+            
     mime["to"] = to
     mime["subject"] = subject
     raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
@@ -151,3 +180,71 @@ def trash_emails_by_query(query: str, max_results: int = 50) -> dict:
             failed += 1
 
     return {"trashed": trashed, "failed": failed, "subjects": subjects}
+
+
+def modify_message_labels(msg_id: str, add_labels: list[str] = None, remove_labels: list[str] = None) -> None:
+    """
+    Modify labels for a specific message (e.g. mark read, archive, star).
+    """
+    service = _get_service()
+    body = {}
+    if add_labels:
+        body["addLabelIds"] = add_labels
+    if remove_labels:
+        body["removeLabelIds"] = remove_labels
+    
+    try:
+        service.users().messages().modify(userId="me", id=msg_id, body=body).execute()
+    except Exception as exc:
+        raise RuntimeError(f"Gmail API error while modifying labels for {msg_id}: {exc}") from exc
+
+
+def download_attachment(msg_id: str, attachment_id: str, filename: str, download_dir: str = ".") -> str:
+    """
+    Download an attachment from an email and save it to the specified directory.
+    Returns the absolute path to the saved file.
+    """
+    service = _get_service()
+    try:
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=msg_id, id=attachment_id
+        ).execute()
+        
+        file_data = base64.urlsafe_b64decode(att["data"])
+        
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir)
+            
+        filepath = os.path.join(download_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(file_data)
+            
+        return os.path.abspath(filepath)
+    except Exception as exc:
+        raise RuntimeError(f"Gmail API error while downloading attachment {filename}: {exc}") from exc
+
+
+def read_text_attachment(msg_id: str, attachment_id: str, mime_type: str) -> str:
+    """
+    Extract text content from a text/csv/pdf attachment for summarisation without saving to disk permanently.
+    """
+    service = _get_service()
+    try:
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=msg_id, id=attachment_id
+        ).execute()
+        
+        file_data = base64.urlsafe_b64decode(att["data"])
+        
+        if mime_type == "application/pdf":
+            import io
+            from pypdf import PdfReader
+            pdf = PdfReader(io.BytesIO(file_data))
+            text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+            return text
+        else:
+            # Assume plain text or CSV
+            return file_data.decode("utf-8", errors="replace")
+            
+    except Exception as exc:
+        raise RuntimeError(f"Gmail API error while reading attachment: {exc}") from exc

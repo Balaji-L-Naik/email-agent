@@ -32,7 +32,7 @@ BANNER = Text.assemble(
 )
 
 SUBTITLE = Text(
-    "Local · Private · Email Agent",
+    "Local · Private · Agent",
     style="dim",
     justify="center",
 )
@@ -107,10 +107,39 @@ def main():
         # Add user message to state
         state["messages"] = state["messages"] + [HumanMessage(content=raw)]
 
-        # Run through graph with spinner
-        with console.status("[cyan]Thinking…[/cyan]", spinner="dots"):
+        # Run through graph with dynamic execution updates
+        with console.status("[cyan]🧠 Understanding request…[/cyan]", spinner="dots") as status:
             try:
-                state = graph.invoke(state)
+                for event in graph.stream(state):
+                    # event is a dict { node_name: state_updates }
+                    node_name = list(event.keys())[0]
+                    node_state = event[node_name]
+                    
+                    # Merge updates into local state
+                    state.update(node_state)
+                    
+                    # Adapt the status message dynamically based on the current context
+                    if node_name == "classify_intent":
+                        intent = state.get("intent", "")
+                        if state.get("pending_send") and state["pending_send"].get("awaiting_confirm"):
+                            status.update("[blue]🚀 Dispatching email via Gmail API…[/blue]")
+                        elif state.get("pending_delete") and state["pending_delete"].get("awaiting_confirm"):
+                            status.update("[blue]🗑️ Moving selected emails to trash…[/blue]")
+                        elif intent == "list_search":
+                            status.update("[cyan]📨 Searching and fetching emails…[/cyan]")
+                        elif intent == "read":
+                            status.update("[cyan]📖 Fetching full email content…[/cyan]")
+                        elif intent == "summarize":
+                            status.update("[cyan]📝 Analyzing emails and generating summary…[/cyan]")
+                        elif intent == "send":
+                            status.update("[cyan]🚀 Extracting email fields and preparing draft…[/cyan]")
+                        elif intent == "delete":
+                            status.update("[cyan]🗑️ Filtering emails for deletion…[/cyan]")
+                        elif intent == "label":
+                            status.update("[cyan]🏷️ Applying labels to email…[/cyan]")
+                        elif intent == "converse":
+                            status.update("[cyan]💬 Generating response…[/cyan]")
+
             except Exception as exc:
                 print_response(f"[red]⚠ An error occurred:[/red] {exc}\n\nPlease try again.")
                 continue

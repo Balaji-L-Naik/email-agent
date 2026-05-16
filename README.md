@@ -1,4 +1,4 @@
-# ✉ Local AI Email Agent
+# Local AI Email Agent
 
 A completely local-first, conversational AI email assistant built with **LangGraph**, **Ollama**, and the **Gmail API**. 
 
@@ -8,16 +8,20 @@ This agent runs directly from your terminal and allows you to manage your Gmail 
 
 ## Features
 
-- **Search & List:** Ask the agent to find specific emails (e.g., *"Find my unread emails from Google"*). The agent translates this into valid Gmail search queries under the hood.
-- **Read:** Read the full body of any email directly in your terminal.
-- **Summarize:** Too long, didn't read? Ask the agent to summarize specific emails or your top 5 unread messages.
-- **Send:** Compose and send emails using natural language. The agent will ask for any missing fields (To, Subject, Body) and will **always ask for your confirmation** before dispatching.
-- **Delete/Trash:** Keep your inbox clean by asking the agent to delete specific emails or bulk-delete spam based on your descriptions (e.g., *"Delete all emails from newsletters@spam.com"*).
-- **Beautiful CLI:** Built with `Typer` and `Rich` for styled panels, interactive spinners, and a clean reading experience.
+- **Search & List:** Ask the agent to find specific emails (e.g., "Find my unread emails from Google"). The agent translates this into valid Gmail search queries under the hood.
+- **Read & Summarize:** Read the full body of any email directly in your terminal. You can also ask the agent to summarize specific emails or your top 5 unread messages.
+- **Label Management:** Organize your inbox naturally. Archive emails, mark them as read/unread, or star/unstar important messages without having to delete them (e.g., "Archive email 1", "Star the 3rd email").
+- **Attachment Handling:** 
+  - **Read & Summarize:** The agent automatically parses text from attached PDF, CSV, or TXT files so it can include them in its summaries and context.
+  - **Download:** Ask the agent to download an attachment, and it will be saved locally to a `downloads` directory.
+  - **Send with Attachments:** Ask the agent to attach local files when composing an email.
+- **Send Emails:** Compose and send emails using natural language. The agent will ask for any missing fields (To, Subject, Body) and will always ask for your confirmation before dispatching.
+- **Delete/Trash:** Keep your inbox clean by asking the agent to delete specific emails or bulk-delete spam based on your descriptions (e.g., "Delete all emails from newsletters@spam.com").
+- **Beautiful CLI:** Built with `Typer` and `Rich` for styled panels, dynamic execution status updates, and a clean reading experience.
 
 ---
 
-## 🛠️ Architecture
+## Architecture
 
 - **Orchestration:** `LangGraph` (state machine for conversational routing and memory).
 - **LLM Engine:** `Ollama` running `qwen2.5-coder:3b` locally.
@@ -75,24 +79,25 @@ python main.py
 On your **first run**, a browser window will open asking you to authorize the app. It requires the following scopes:
 - `gmail.readonly` (to read and search emails)
 - `gmail.send` / `gmail.compose` (to send emails)
-- `gmail.modify` (to move emails to the trash)
+- `gmail.modify` (to move emails to the trash and apply labels)
 
 Once authorized, a `token.pickle` file will be generated locally.
 
 ### Example Prompts
 Here are a few things you can type in the interactive prompt:
 
-- *"List my top 5 unread emails."*
-- *"Search for emails from github this week."*
-- *"Read email number 2."*
-- *"Summarize those emails."*
-- *"Send an email to john@example.com about the meeting tomorrow."*
-- *"Delete the 3rd email."*
-- *"Delete all my emails from spammy-marketing@example.com"*
+- "List my top 5 unread emails."
+- "Search for emails from github this week."
+- "Read email number 2."
+- "Summarize those emails."
+- "Mark the first email as read and archive it."
+- "Download the attachment from email 2."
+- "Send an email to john@example.com about the meeting tomorrow and attach C:\path\to\report.pdf"
+- "Delete the 3rd email."
 
 Type `exit` or `quit` to leave the agent.
 
 ---
 
-## 🔒 Privacy Notice
+## Privacy Notice
 Your `credentials.json` and `token.pickle` grant direct access to your Gmail account. **Never commit these files to version control.** They are included in the `.gitignore` by default. All LLM reasoning is done entirely locally via Ollama.
