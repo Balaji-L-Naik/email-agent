@@ -50,23 +50,34 @@ def search_emails(query: str = "", max_results: int = 10) -> list[dict]:
     messages = results.get("messages", [])
     output = []
 
+    import time
+
     for msg in messages:
-        try:
-            full = service.users().messages().get(
-                userId="me", id=msg["id"], format="metadata",
-                metadataHeaders=["Subject", "From", "Date"]
-            ).execute()
-            headers = extract_headers(full)
-            output.append({
-                "id": msg["id"],
-                "subject": headers["subject"],
-                "from_addr": headers["from_addr"],
-                "date": headers["date"],
-                "snippet": full.get("snippet", ""),
-            })
-        except Exception:
-            # Skip malformed messages silently
-            continue
+        # Retry mechanism for the individual metadata fetches
+        for attempt in range(3):
+            try:
+                full = service.users().messages().get(
+                    userId="me", id=msg["id"], format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"]
+                ).execute()
+                
+                headers = extract_headers(full)
+                output.append({
+                    "id": msg["id"],
+                    "subject": headers["subject"],
+                    "from_addr": headers["from_addr"],
+                    "date": headers["date"],
+                    "snippet": full.get("snippet", ""),
+                })
+                break # Success! Break out of the retry loop
+            except Exception as exc:
+                # If it's an SSL/EOF connection hiccup, wait briefly and try again
+                if "EOF" in str(exc) or "protocol" in str(exc).lower():
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1)) # exponential backoff
+                        continue
+                # Skip if it genuinely fails or keeps failing
+                break 
 
     return output
 
@@ -106,18 +117,28 @@ import mimetypes
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from email.mime.text import MIMEText
+from email.charset import Charset, QP
 
-def send_email(to: str, subject: str, body: str, attachments: list[str] = None) -> str:
+def send_email(to: str, subject: str, body: str, attachments: list[str] = None, is_html: bool = False) -> str:
     """
     Send an email via the authenticated Gmail account, with optional attachments.
     """
     service = _get_service()
+    mime_subtype = "html" if is_html else "plain"
+    # Create a Charset object for utf-8 and set encoding to quoted-printable
+    cs = Charset('utf-8')
+    cs.body_encoding = QP 
+    
+    # Create the text object with the explicit charset
+    msg_text = MIMEText(body, mime_subtype, 'utf-8')
+    msg_text.set_charset(cs)
     
     if not attachments:
-        mime = MIMEText(body)
+        mime = MIMEText(body,mime_subtype)
     else:
         mime = MIMEMultipart()
-        mime.attach(MIMEText(body))
+        mime.attach(MIMEText(body,mime_subtype))
         
         for file_path in attachments:
             if not os.path.exists(file_path):

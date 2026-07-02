@@ -2,28 +2,13 @@
 agent/graph.py
 --------------
 LangGraph state machine for the email agent.
-
-Nodes
------
-classify_intent   → decides what the user wants
-handle_list       → list / search emails
-handle_read       → read a specific email body
-handle_summarize  → LLM summarisation of fetched emails
-handle_send       → compose + preview + confirm + dispatch
-handle_converse   → general chat / fallback
-
-State
------
-messages       : list of HumanMessage / AIMessage (conversation history)
-emails         : list of email metadata dicts from last search
-pending_send   : { to, subject, body } or None
-intent         : one of list_search | read | summarize | send | converse
 """
 
 from __future__ import annotations
 
 import json
 import re
+import datetime
 from typing import Annotated, Any, Optional
 from typing_extensions import TypedDict
 
@@ -32,13 +17,18 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
-from gmail.tools import get_email_body, search_emails, send_email, trash_email, trash_emails_by_query
+from gmail.tools import get_email_body, search_emails, send_email, trash_email, trash_emails_by_query, modify_message_labels
+from gmail.client import get_authenticated_email
+from tasks.tools import add_multiple_google_tasks
 
 # ---------------------------------------------------------------------------
-# LLM
+# CONFIGURATION
 # ---------------------------------------------------------------------------
 
-llm = ChatOllama(model="qwen2.5-coder:3b", temperature=0)
+
+
+# Upgraded to Llama 3.1!
+llm = ChatOllama(model="llama3.1", temperature=0)
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -49,8 +39,10 @@ class AgentState(TypedDict):
     emails: list[dict]
     pending_send: Optional[dict]
     pending_delete: Optional[dict]
+    pending_todo: Optional[dict]
+    triage_config: Optional[dict]  # <-- ADDED: Allows programmatic bypass of LLM configuration
     intent: str
-    response: str          # the text to show the user
+    response: str
 
 
 # ---------------------------------------------------------------------------
@@ -58,33 +50,70 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 INTENT_SYSTEM = """You are an intent classifier for an email assistant.
-Given the user's latest message and the conversation so far, output EXACTLY one of these labels (no other text):
+Given the user's latest message and the conversation so far, output EXACTLY one of these labels (no other text, no punctuation):
   list_search
   read
   summarize
   send
   delete
   label
+  todo
+  triage
   converse
 
 Rules:
 - list_search  : user wants to list or search for emails
-- read         : user wants to read / open a specific email (or download attachments)
+- read         : user wants to read / open a specific email
 - summarize    : user wants a summary of one or more emails
 - send         : user wants to compose or send an email
-- delete       : user wants to delete or trash emails (e.g. spam)
+- delete       : user wants to delete or trash emails
 - label        : user wants to archive, star, or mark emails as read/unread
+- todo         : user wants to create a reminder, task, or to-do item
+- triage       : user wants to run a daily sorting/filtering batch job based on keywords
 - converse     : anything else (greeting, question, help, etc.)
+"""
+
+TRIAGE_CONFIG_SYSTEM = """You extract configuration for a daily email triage batch job.
+Read the user's instructions and output a strict JSON object.
+
+FORMAT REQUIREMENT:
+{
+  "keywords": ["keyword1", "keyword2"],
+  "add_tasks": true or false,
+  "label_to_add": "IMPORTANT" or "STARRED" or null,
+  "timeframe": "1d" (use "7d" for this week, "1m" for this month, default "1d"),
+  "max_results": 40 (increase up to 50 if user asks for a lot of emails),
+  "use_semantic": false (true if they specifically ask for semantic, conceptual, or AI search)
+}
+
+RULES:
+- "keywords" must be a list of strings the user wants to search for.
+- "add_tasks" is true if they mention adding tasks, todos, or deadlines.
+- "label_to_add" is "IMPORTANT" if they say "mark as imp/important", "STARRED" if they want it starred, else null.
+DO NOT wrap the output in markdown code blocks. Output ONLY raw JSON.
+"""
+
+EXTRACT_TODO_SYSTEM = """You are a strict data extractor.
+You must extract task details from the user's instruction and the conversational context.
+
+CRITICAL INSTRUCTIONS:
+- Output ONLY a raw, valid JSON array.
+- DO NOT wrap the output in markdown code blocks (```json).
+- DO NOT add any conversational text before or after the JSON.
+- If you cannot extract a task, output an empty array: []
+
+FORMAT REQUIREMENT:
+[
+  {
+    "title": "Short summary of the task",
+    "notes": "Relevant details from the email",
+    "due_date": "YYYY-MM-DDTHH:MM:SS.000Z"
+  }
+]
 """
 
 SEARCH_QUERY_SYSTEM = """You are a Gmail query builder.
 Given the user's instruction, output ONLY a valid Gmail search query string (no explanation, no quotes around the whole thing).
-Examples:
-  "unread" → is:unread
-  "emails from john" → from:john
-  "emails about invoice this week" → subject:invoice newer_than:7d
-  "unread emails from google" → is:unread from:google
-If the user just wants all unread, output: is:unread
 """
 
 SUMMARIZE_SYSTEM = """You are a concise email summariser.
@@ -92,7 +121,6 @@ Summarise the provided emails clearly. For each email highlight:
 - Core message
 - Any action items or deadlines
 - Important names or decisions
-
 Do NOT invent any information not present in the emails.
 """
 
@@ -100,7 +128,6 @@ EXTRACT_SEND_SYSTEM = """You are an email field extractor.
 From the user's instruction extract: recipient email (to), subject, body, and an array of absolute file paths for attachments.
 Output ONLY valid JSON like:
 {"to": "...", "subject": "...", "body": "...", "attachments": ["/path/to/file1.pdf"]}
-Use null or an empty list for any field the user did not mention.
 """
 
 # ---------------------------------------------------------------------------
@@ -108,6 +135,11 @@ Use null or an empty list for any field the user did not mention.
 # ---------------------------------------------------------------------------
 
 def classify_intent(state: AgentState) -> AgentState:
+    # --- PROGRAMMATIC OVERRIDE ---
+    # If this is an automated run with a predefined config, skip LLM classification entirely
+    if state.get("triage_config"):
+        return {**state, "intent": "triage"}
+
     history = state["messages"]
     last_human = next(
         (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
@@ -119,80 +151,299 @@ def classify_intent(state: AgentState) -> AgentState:
     ])
     raw = resp.content.strip().lower()
 
-    valid = {"list_search", "read", "summarize", "send", "delete", "label", "converse"}
-    intent = raw if raw in valid else "converse"
+    # Priority hybrid routing
+    valid_intents = ["list_search", "read", "summarize", "send", "delete", "label", "todo", "triage", "converse"]
+    
+    intent = "converse"
+    for v in valid_intents:
+        if v in raw:
+            intent = v
+            break
+
+    # Hard-coded quick intercepts for reliability
+    lower_human = last_human.lower()
+    if "triage" in lower_human or "daily" in lower_human or "sort out" in lower_human:
+        intent = "triage"
+    elif "task" in lower_human or "todo" in lower_human or "remind" in lower_human:
+        intent = "todo"
+    
     return {**state, "intent": intent}
 
 
 # ---------------------------------------------------------------------------
-# Node: list / search emails
+# Node: Daily Triage (Autonomous Batch Job)
 # ---------------------------------------------------------------------------
 
-def handle_list_search(state: AgentState) -> AgentState:
+def handle_triage(state: AgentState) -> AgentState:
     history = state["messages"]
     last_human = next(
         (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
     )
+    
+    # --- PROGRAMMATIC CONFIG CHECK ---
+    config = state.get("triage_config")
+    
+    if not config:
+        # Fallback to LLM extraction if running from the interactive chat CLI
+        config_resp = llm.invoke([
+            SystemMessage(content=TRIAGE_CONFIG_SYSTEM),
+            HumanMessage(content=last_human),
+        ])
+        
+        raw_json = config_resp.content.strip()
+        raw_json = re.sub(r"```json\s*", "", raw_json)
+        raw_json = re.sub(r"```\s*", "", raw_json).strip()
+        
+        try:
+            config = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return {**state, "response": f"⚠ Could not parse triage instructions. Please try rephrasing your keywords.\n[dim]Model Output:\n{raw_json}[/dim]"}
+            
+    keywords = config.get("keywords", [])
+    if not keywords:
+        return {**state, "response": "I couldn't detect any keywords to search for. Please specify keywords like 'keywords: AI, jobs, offers'."}
 
-    # Build Gmail query with LLM
-    q_resp = llm.invoke([
-        SystemMessage(content=SEARCH_QUERY_SYSTEM),
-        HumanMessage(content=last_human),
-    ])
-    query = q_resp.content.strip().strip('"').strip("'")
+    timeframe = str(config.get("timeframe", "1d"))
+    max_results = int(config.get("max_results", 20))
+    use_semantic = config.get("use_semantic", False)
 
-    try:
-        emails = search_emails(query=query, max_results=10)
-    except RuntimeError as e:
-        return {**state, "emails": [], "response": f"⚠ Could not fetch emails: {e}"}
+    # FIX: Define user_category OUTSIDE the if/else blocks so the summarizer can use it!
+    user_category = ", ".join(keywords)
 
-    if not emails:
-        return {**state, "emails": [], "response": "No emails matched your search."}
-
-    lines = []
-    for i, em in enumerate(emails, 1):
-        lines.append(
-            f"{i:>2}. [bold]{em['subject']}[/bold]\n"
-            f"    From : {em['from_addr']}\n"
-            f"    Date : {em['date']}\n"
-            f"    {em['snippet'][:120]}…"
+    if use_semantic:
+        # --- SEMANTIC SEARCH FLOW (RAG) ---
+        print(f"DEBUG: Using Semantic Search (RAG) for concepts: {keywords}")
+        from vector.tools import semantic_search_emails
+        concept = " ".join(keywords)
+        rag_results = semantic_search_emails(query=concept, n_results=max_results)
+        
+        # Format the RAG results back into the dictionary structure the downstream code expects
+        matched_emails = []
+        for res in rag_results:
+            matched_emails.append({
+                "id": res["id"],
+                "subject": res["subject"],
+                "from_addr": res["from"],
+                "date": res["date"]
+            })
+    else:
+        # --- ORIGINAL GMAIL KEYWORD FLOW ---
+        expansion_prompt = (
+            f"You are a search query expansion tool. The user is interested in the category: '{user_category}'.\n"
+            f"Generate 10 highly relevant terms to search for. "
+            f"Include synonyms AND well-known brands, companies, or platforms associated with this category "
+            f"(e.g., if the category is 'courses', you might include 'udemy, coursera, edx, class').\n"
+            f"Output ONLY a comma-separated list of single words, nothing else."
         )
+        
+        expansion_resp = llm.invoke([HumanMessage(content=expansion_prompt)])
+        expanded_words = [w.strip() for w in expansion_resp.content.replace('"', '').split(',') if w.strip()]
+        
+        all_search_terms = list(set([k.lower() for k in keywords] + [w.lower() for w in expanded_words]))
+        keyword_str = " OR ".join([f'"{k}"' for k in all_search_terms])
+        
+        query = f"({keyword_str}) newer_than:{timeframe}"
+        print(f"DEBUG: Expanded Categorical & Brand Query: {query}")
+        
+        try:
+            matched_emails = search_emails(query=query, max_results=max_results)
+        except RuntimeError as e:
+            return {**state, "response": f"⚠ Gmail Search Failed: {e}"}
+            
+    if not matched_emails:
+        return {**state, "response": f"No emails found matching your criteria."}
 
-    response = "\n".join(lines)
+    print(f"DEBUG: Found {len(matched_emails)} emails for triage.")
+    
+    # Fetch full bodies and combine
+    parts = []
+    for i, em in enumerate(matched_emails, 1):
+        try:
+            full = get_email_body(em["id"])
+            body_text = full['body'][:1000] # Truncate slightly to save context window
+            parts.append(
+                f"<email_item index='{i}'>\n"
+                f"From: {full['from_addr']}\n"
+                f"Subject: {full['subject']}\n"
+                f"Date: {full['date']}\n"
+                f"Body: {body_text}\n"
+                f"</email_item>"
+            )
+        except RuntimeError:
+            continue
+            
+    combined_context = "\n\n".join(parts)
+    
+    # --- 3. SEMANTIC FILTERING & HTML SUMMARY ---
+    sem_prompt_instruction = (
+    f"You are a strict Categorical Filter and professional Email Summarizer.\n"
+    f"The user is ONLY interested in the category: '{user_category}'.\n\n"
+    
+    f"INSTRUCTIONS:\n"
+    f"1. EVALUATE: If an email is NOT relevant to '{user_category}', discard it.\n"
+    f"2. SUMMARIZE: Summarize ONLY relevant emails. \n"
+    f"3. FORMAT: Output ONLY valid, clean HTML. \n"
+    f"- DO NOT use numbered lists (1., 2.) or Markdown (**, -).\n"
+    f"- You MUST use <ul> and <li> tags for lists.\n"
+    f"- You MUST use <h3> for email titles.\n\n"
+    
+    f"HTML STRUCTURE REQUIREMENTS:\n"
+    f"<h2>Daily Digest: {user_category}</h2>\n"
+    f"<h3>[Email Title]</h3>\n"
+    f"<p>[Description]</p>\n"
+    f"<ul><li>[Key Point 1]</li><li>[Key Point 2]</li></ul>\n\n"
+    
+    f"FALLBACK:\n"
+    f"If no emails are relevant, output ONLY: <h2>No highly relevant emails found for this category today.</h2>"
+)
+    
+    summary_resp = llm.invoke([
+        SystemMessage(content=SUMMARIZE_SYSTEM),
+        HumanMessage(content=f"{sem_prompt_instruction}\n\n{combined_context}"),
+    ])
+    
+    digest_body = summary_resp.content.strip()
+    
+    # Force basic HTML cleanup if the LLM adds markdown wrappers
+    digest_body = digest_body.replace("```html", "").replace("```", "")
+    
+    # If the output doesn't contain at least one <h3>, it's likely a failure.
+    if "<h3>" not in digest_body:
+        digest_body = f"<h2>Summary</h2><p>{digest_body}</p>"
+    # Wrap in a container if needed
+    if not digest_body.startswith("<"):
+        digest_body = f"<div>{digest_body}</div>"
+
+
+# Automate Execution (Labels, Tasks, Emailing self)
+    execution_log_html_items = []
+    execution_log_cli = f"✅ Triage complete! Processed {len(matched_emails)} emails.\n"
+    execution_log_html = ""
+
+
+    # --- SMART LABEL LOGIC ---
+    label_to_add = config.get("label_to_add")
+    if label_to_add:
+        lbl_lower = label_to_add.lower()
+        add_labels = []
+        remove_labels = []
+        
+        # Translate conversational terms into correct Gmail API System IDs
+        if "star" in lbl_lower: add_labels.append("STARRED")
+        elif "imp" in lbl_lower: add_labels.append("IMPORTANT")
+        elif "unread" in lbl_lower: add_labels.append("UNREAD")
+        elif "read" in lbl_lower: remove_labels.append("UNREAD") # Remove UNREAD to mark as Read!
+        else: add_labels.append(label_to_add.upper())
+
+        success_count = 0
+        if add_labels or remove_labels:
+            for em in matched_emails:
+                try:
+                    modify_message_labels(em["id"], add_labels=add_labels if add_labels else None, remove_labels=remove_labels if remove_labels else None)
+                    success_count += 1
+                except Exception as e:
+                    print(f"DEBUG: Failed to label email {em['id']}: {e}")
+            
+            label_action_str = f"Applied '{label_to_add}' logic to {success_count} emails"
+            execution_log_html_items.append(f"<li>🏷️ {label_action_str}</li>")
+            execution_log_cli += f"- 🏷️ {label_action_str}.\n"
+        
+    # Tasks
+    if config.get("add_tasks"):
+        current_time = datetime.datetime.now().isoformat() + "Z"
+        task_prompt = f"Current time: {current_time}\n\nExtract tasks from these emails:\n\n{combined_context}"
+        task_resp = llm.invoke([
+            SystemMessage(content=EXTRACT_TODO_SYSTEM),
+            HumanMessage(content=task_prompt),
+        ])
+        
+        raw_task_json = task_resp.content.strip()
+        raw_task_json = re.sub(r"```json\s*", "", raw_task_json)
+        raw_task_json = re.sub(r"```\s*", "", raw_task_json).strip()
+        
+        try:
+            tasks_list = json.loads(raw_task_json)
+            if isinstance(tasks_list, list) and tasks_list:
+                results = add_multiple_google_tasks(tasks_list)
+                execution_log_html_items.append(f"<li>📝 Added <b>{len(results)}</b> tasks to Google Tasks.</li>")
+                execution_log_cli += f"- 📝 Added {len(results)} tasks to Google Tasks.\n"
+            else:
+                 execution_log_html += "<li>📝 No deadlines/tasks found to add.</li>"
+                 execution_log_cli += "- 📝 No deadlines/tasks found to add.\n"
+        except json.JSONDecodeError:
+            execution_log_html += "<li>⚠ Failed to parse tasks from the LLM output.</li>"
+            execution_log_cli += "- ⚠ Failed to parse tasks from the LLM output.\n"
+
+    execution_log_html = "".join(execution_log_html_items)
+
+
+    # Email Digest to Self using HTML flag
+    try:
+        user_email = get_authenticated_email()
+        if not user_email:
+            raise Exception("Could not determine your authenticated email address.")
+        
+        subject_line = f"Daily Agent Digest: {', '.join(keywords)}"
+        # Construct the final HTML body
+        email_body_html = (
+            f"<html><body>"
+            f"<h2>Agent Execution Log:</h2><ul>{execution_log_html}</ul>"
+            f"<hr><br>{digest_body}"
+            f"</body></html>"
+        )
+        
+        # NOTE: is_html=True makes the magic happen!
+        send_email(to=user_email, subject=subject_line, body=email_body_html, is_html=True)
+        execution_log_cli += f"- 📧 Daily HTML Digest sent to {user_email}.\n"
+    except Exception as e:
+        execution_log_cli += f"- ⚠ Could not send digest email: {e}\n"
+
+    # Final response to CLI
+    final_response = f"{execution_log_cli}\n{'─' * 50}\n[bold]Digest Preview (HTML Source):[/bold]\n\n{digest_body}"
+    
     return {
         **state,
-        "emails": emails,
-        "response": response,
-        "messages": state["messages"] + [AIMessage(content=response)],
+        "response": final_response,
+        "messages": state["messages"] + [AIMessage(content=final_response)],
     }
 
 
 # ---------------------------------------------------------------------------
-# Node: read a specific email
+# Other Nodes
 # ---------------------------------------------------------------------------
+
+def handle_list_search(state: AgentState) -> AgentState:
+    history = state["messages"]
+    last_human = next((m.content for m in reversed(history) if isinstance(m, HumanMessage)), "")
+    q_resp = llm.invoke([SystemMessage(content=SEARCH_QUERY_SYSTEM), HumanMessage(content=last_human)])
+    query = q_resp.content.strip().strip('"').strip("'")
+    try:
+        emails = search_emails(query=query, max_results=10)
+    except RuntimeError as e:
+        return {**state, "emails": [], "response": f"⚠ Could not fetch emails: {e}"}
+    if not emails:
+        return {**state, "emails": [], "response": "No emails matched your search."}
+    lines = []
+    for i, em in enumerate(emails, 1):
+        lines.append(f"{i:>2}. [bold]{em['subject']}[/bold]\n    From : {em['from_addr']}\n    Date : {em['date']}\n    {em['snippet'][:120]}…")
+    response = "\n".join(lines)
+    return {**state, "emails": emails, "response": response, "messages": state["messages"] + [AIMessage(content=response)]}
 
 def handle_read(state: AgentState) -> AgentState:
     emails = state.get("emails", [])
     history = state["messages"]
-    last_human = next(
-        (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
-    )
-
-    # Try to find a number in the user's message
+    last_human = next((m.content for m in reversed(history) if isinstance(m, HumanMessage)), "")
     numbers = re.findall(r"\b(\d+)\b", last_human)
     idx = int(numbers[0]) - 1 if numbers else 0
-
     if not emails:
         return {**state, "response": "Please list or search emails first so I know which one to open."}
-
     if idx < 0 or idx >= len(emails):
         return {**state, "response": f"I only have {len(emails)} email(s) listed. Please specify a valid number."}
-
     try:
         full = get_email_body(emails[idx]["id"])
     except RuntimeError as e:
         return {**state, "response": f"⚠ Could not fetch email: {e}"}
-
+    
     att_text = ""
     if full.get("attachments"):
         att_text = "\n\n[bold]Attachments:[/bold]\n"
@@ -206,75 +457,32 @@ def handle_read(state: AgentState) -> AgentState:
                 except Exception as e:
                     att_text += f"   ⚠ Failed to download: {e}\n"
 
-    response = (
-        f"[bold]Subject:[/bold] {full['subject']}\n"
-        f"[bold]From:[/bold]    {full['from_addr']}\n"
-        f"[bold]Date:[/bold]    {full['date']}\n"
-        f"{'─' * 60}\n"
-        f"{full['body']}{att_text}"
-    )
-    return {
-        **state,
-        "response": response,
-        "messages": state["messages"] + [AIMessage(content=response)],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Node: summarize
-# ---------------------------------------------------------------------------
+    response = f"[bold]Subject:[/bold] {full['subject']}\n[bold]From:[/bold]    {full['from_addr']}\n[bold]Date:[/bold]    {full['date']}\n{'─' * 60}\n{full['body']}{att_text}"
+    return {**state, "response": response, "messages": state["messages"] + [AIMessage(content=response)]}
 
 def handle_summarize(state: AgentState) -> AgentState:
     emails = state.get("emails", [])
     history = state["messages"]
-    last_human = next(
-        (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
-    )
-
+    last_human = next((m.content for m in reversed(history) if isinstance(m, HumanMessage)), "")
     if not emails:
         return {**state, "response": "Please list or search emails first so I know what to summarise."}
-
-    # Determine how many to summarise
     numbers = re.findall(r"\b(\d+)\b", last_human)
     count = int(numbers[0]) if numbers else len(emails)
     count = min(count, len(emails))
-
     parts = []
-    for em in emails[:count]:
+    for i, em in enumerate(emails[:count], 1):
         try:
             full = get_email_body(em["id"])
             body_text = full['body']
-            
-            # Read attachment text if present
-            if full.get("attachments"):
-                for att in full["attachments"]:
-                    if att["mimeType"] in ["text/plain", "text/csv", "application/pdf"]:
-                        try:
-                            from gmail.tools import read_text_attachment
-                            att_text = read_text_attachment(em["id"], att["attachmentId"], att["mimeType"])
-                            body_text += f"\n\n[Attachment: {att['filename']}]\n{att_text}"
-                        except Exception:
-                            pass
-
-            parts.append(
-                f"--- Email from {full['from_addr']} | {full['subject']} ---\n{body_text}"
-            )
+            if len(body_text) > 1500: body_text = body_text[:1500] + "\n... [Content Truncated] ..."
+            parts.append(f"<email_item index='{i}'>\nFrom: {full['from_addr']}\nSubject: {full['subject']}\nDate: {full['date']}\nBody:\n{body_text}\n</email_item>")
         except RuntimeError:
-            parts.append(f"--- Email (could not fetch body): {em['subject']} ---")
-
+            parts.append(f"<email_item index='{i}'>\nCould not fetch body for: {em['subject']}\n</email_item>")
     combined = "\n\n".join(parts)
-
-    summary_resp = llm.invoke([
-        SystemMessage(content=SUMMARIZE_SYSTEM),
-        HumanMessage(content=f"Summarise these {count} email(s):\n\n{combined}"),
-    ])
+    prompt_instruction = f"You are given {count} distinct emails wrapped in `<email_item>` tags. Provide a numbered list summarizing EACH email individually."
+    summary_resp = llm.invoke([SystemMessage(content=SUMMARIZE_SYSTEM), HumanMessage(content=f"{prompt_instruction}\n\n{combined}")])
     summary = summary_resp.content.strip()
-
-    return {
-        **state,
-        "response": summary,
-        "messages": state["messages"] + [AIMessage(content=summary)],
-    }
+    return {**state, "response": summary, "messages": state["messages"] + [AIMessage(content=summary)]}
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +662,7 @@ def handle_delete(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node: label email
+# Node:     label email
 # ---------------------------------------------------------------------------
 
 def handle_label(state: AgentState) -> AgentState:
@@ -502,6 +710,117 @@ def handle_label(state: AgentState) -> AgentState:
     except Exception as e:
         return {**state, "response": f"⚠ Failed to update labels: {e}"}
 
+# ---------------------------------------------------------------------------
+# Node: TO DO List
+# ---------------------------------------------------------------------------
+
+
+# 2. Update the handle_todo node to cleanly catch JSON failures:
+def handle_todo(state: AgentState) -> AgentState:
+    history = state["messages"]
+    last_human = next(
+        (m.content for m in reversed(history) if isinstance(m, HumanMessage)), ""
+    )
+    pending = state.get("pending_todo") or {}
+
+    # --- STEP 1: Check if user is confirming a pending task ---
+    confirmation_words = {"yes", "confirm", "do it", "go ahead", "yep", "y", "sure"}
+    denial_words = {"no", "cancel", "abort", "don't", "stop", "nope", "n"}
+
+    if pending and pending.get("awaiting_confirm"):
+        lower = last_human.lower().strip()
+        if any(w in lower for w in confirmation_words):
+            try:
+                # Add multiple tasks from the pending state
+                from tasks.tools import add_multiple_google_tasks
+                results = add_multiple_google_tasks(pending["tasks"])
+                
+                response_msg = f"✅ Added {len(results)} task(s) to Google Tasks:\n"
+                for t in results:
+                    response_msg += f"- [bold]{t.get('title')}[/bold]\n"
+                
+                return {
+                    **state,
+                    "pending_todo": None,
+                    "response": response_msg,
+                    "messages": state["messages"] + [AIMessage(content=response_msg)],
+                }
+            except RuntimeError as e:
+                return {**state, "response": f"⚠ Failed to create task: {e}"}
+        
+        elif any(w in lower for w in denial_words):
+            return {
+                **state,
+                "pending_todo": None,
+                "response": "Cancelled. Task was not created.",
+                "messages": state["messages"] + [AIMessage(content="Task creation cancelled.")],
+            }
+
+    # --- STEP 2: Extract task details ---
+    last_ai = next(
+        (m.content for m in reversed(history) if isinstance(m, AIMessage)), ""
+    )
+
+    import datetime
+    current_time = datetime.datetime.now().isoformat() + "Z"
+    context_prompt = (
+        f"Current time: {current_time}\n\n"
+        f"User Instruction: {last_human}\n\n"
+        f"Email Context:\n{last_ai}"
+    )
+
+    extract_resp = llm.invoke([
+        SystemMessage(content=EXTRACT_TODO_SYSTEM),
+        HumanMessage(content=context_prompt),
+    ])
+    
+    raw_json = extract_resp.content.strip()
+    
+    # Aggressively clean up common LLM formatting mistakes
+    import re
+    raw_json = re.sub(r"```json\s*", "", raw_json)
+    raw_json = re.sub(r"```\s*", "", raw_json)
+    raw_json = raw_json.strip()
+
+    import json
+    try:
+        tasks_list = json.loads(raw_json)
+        if not isinstance(tasks_list, list):
+            tasks_list = [tasks_list] # Fallback if it outputs a single dict
+    except json.JSONDecodeError as e:
+        # Give visibility into what the model actually outputted to help debugging
+        return {
+            **state, 
+            "response": f"⚠ Could not parse task details. The model failed to output raw JSON.\n\n[dim]Model Output:\n{raw_json}[/dim]"
+        }
+
+    if not tasks_list or not tasks_list[0].get("title"):
+        return {**state, "response": "I couldn't figure out what the task should be. Please provide more details."}
+
+    # --- STEP 3: Show preview and ask for confirmation ---
+    preview = "[bold]Tasks to add:[/bold]\n\n"
+    for t in tasks_list:
+        title = t.get("title", "Untitled Task")
+        notes = t.get("notes", "")
+        due = t.get("due_date", "")
+        due_str = f"Due: {due[:10]}" if due else "No due date"
+        
+        preview += f"🔹 [bold]{title}[/bold] ({due_str})\n"
+        if notes:
+            preview += f"   Notes: {notes}\n"
+    
+    preview += f"\n{'─' * 50}\nReply [bold green]yes[/bold green] to add these tasks, or [bold red]no[/bold red] to cancel."
+    
+    return {
+        **state,
+        "pending_todo": {
+            "tasks": tasks_list,
+            "awaiting_confirm": True
+        },
+        "response": preview,
+        "messages": state["messages"] + [AIMessage(content=preview)],
+    }
+
 
 # ---------------------------------------------------------------------------
 # Node: general conversation
@@ -513,7 +832,7 @@ def handle_converse(state: AgentState) -> AgentState:
         SystemMessage(content=(
             "You are a helpful local email assistant. Answer the user's question concisely. "
             "If the user asks what you can do, explain: list/search emails, read emails, "
-            "summarise emails, delete emails, and send emails — all locally via Gmail API."
+            "summarise emails, delete emails, and send emails and create todo lists — all locally via Gmail API."
         )),
         *history,
     ])
@@ -530,12 +849,16 @@ def handle_converse(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 def router(state: AgentState) -> str:
-    intent = state.get("intent", "converse")
-    # If there's a pending send, route straight to handle_send regardless
     if state.get("pending_send") and state["pending_send"].get("awaiting_confirm"):
         return "handle_send"
     if state.get("pending_delete") and state["pending_delete"].get("awaiting_confirm"):
         return "handle_delete"
+        
+    # <-- ADD THIS BLOCK -->
+    if state.get("pending_todo") and state["pending_todo"].get("awaiting_confirm"):
+        return "handle_todo"
+        
+    intent = state.get("intent", "converse")
     mapping = {
         "list_search": "handle_list_search",
         "read": "handle_read",
@@ -543,6 +866,8 @@ def router(state: AgentState) -> str:
         "send": "handle_send",
         "delete": "handle_delete",
         "label": "handle_label",
+        "todo": "handle_todo",
+        "triage": "handle_triage",  # <-- ADDED triage mapping
         "converse": "handle_converse",
     }
     return mapping.get(intent, "handle_converse")
@@ -562,6 +887,8 @@ def build_graph() -> StateGraph:
     g.add_node("handle_send", handle_send)
     g.add_node("handle_delete", handle_delete)
     g.add_node("handle_label", handle_label)
+    g.add_node("handle_todo", handle_todo)
+    g.add_node("handle_triage", handle_triage)  # <-- ADDED triage node
     g.add_node("handle_converse", handle_converse)
 
     g.set_entry_point("classify_intent")
@@ -576,12 +903,14 @@ def build_graph() -> StateGraph:
             "handle_send": "handle_send",
             "handle_delete": "handle_delete",
             "handle_label": "handle_label",
+            "handle_todo": "handle_todo",
+            "handle_triage": "handle_triage",  # <-- ADDED triage edge
             "handle_converse": "handle_converse",
         },
     )
 
     for node in ["handle_list_search", "handle_read", "handle_summarize",
-                 "handle_send", "handle_delete", "handle_label", "handle_converse"]:
+                 "handle_send", "handle_delete", "handle_label", "handle_todo", "handle_triage", "handle_converse"]:  # <-- ADDED triage to END
         g.add_edge(node, END)
 
     return g.compile()

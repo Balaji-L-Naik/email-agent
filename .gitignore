@@ -219,3 +219,8 @@ __marimo__/
 
 token.pickle
 credentials.json
+
+
+email_vector_db/
+
+downloads/

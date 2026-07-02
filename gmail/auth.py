@@ -10,6 +10,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",   # needed for trash / delete
+    "https://www.googleapis.com/auth/tasks",
 ]
 
 TOKEN_FILE = "token.pickle"

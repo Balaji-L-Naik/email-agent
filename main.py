@@ -74,6 +74,8 @@ def initial_state():
         "messages": [],
         "emails": [],
         "pending_send": None,
+        "pending_delete": None,
+        "pending_todo": None,    # <-- NEW
         "intent": "converse",
         "response": "",
     }
@@ -137,9 +139,12 @@ def main():
                             status.update("[cyan]🗑️ Filtering emails for deletion…[/cyan]")
                         elif intent == "label":
                             status.update("[cyan]🏷️ Applying labels to email…[/cyan]")
+                        elif intent == "todo":
+                            status.update("[cyan]✅ Extracting task details and syncing to Google Tasks…[/cyan]")
+                        elif intent == "triage":
+                            status.update("[cyan]🧠 Running Daily Triage: Searching, parsing, and summarizing... this may take a moment![/cyan]")
                         elif intent == "converse":
                             status.update("[cyan]💬 Generating response…[/cyan]")
-
             except Exception as exc:
                 print_response(f"[red]⚠ An error occurred:[/red] {exc}\n\nPlease try again.")
                 continue
