@@ -271,48 +271,77 @@ def handle_triage(state: AgentState) -> AgentState:
             )
         except RuntimeError:
             continue
+
+   
             
     combined_context = "\n\n".join(parts)
     
     # --- 3. SEMANTIC FILTERING & HTML SUMMARY ---
-    sem_prompt_instruction = (
-    f"You are a strict Categorical Filter and professional Email Summarizer.\n"
-    f"The user is ONLY interested in the category: '{user_category}'.\n\n"
-    
-    f"INSTRUCTIONS:\n"
-    f"1. EVALUATE: If an email is NOT relevant to '{user_category}', discard it.\n"
-    f"2. SUMMARIZE: Summarize ONLY relevant emails. \n"
-    f"3. FORMAT: Output ONLY valid, clean HTML. \n"
-    f"- DO NOT use numbered lists (1., 2.) or Markdown (**, -).\n"
-    f"- You MUST use <ul> and <li> tags for lists.\n"
-    f"- You MUST use <h3> for email titles.\n\n"
-    
-    f"HTML STRUCTURE REQUIREMENTS:\n"
-    f"<h2>Daily Digest: {user_category}</h2>\n"
-    f"<h3>[Email Title]</h3>\n"
-    f"<p>[Description]</p>\n"
-    f"<ul><li>[Key Point 1]</li><li>[Key Point 2]</li></ul>\n\n"
-    
-    f"FALLBACK:\n"
-    f"If no emails are relevant, output ONLY: <h2>No highly relevant emails found for this category today.</h2>"
-)
-    
+#     sem_prompt_instruction = (
+#     f"STRICT RULES:\n"
+#     f"- YOU ARE A DATA EXTRACTOR. Do NOT summarize newsletters.\n"
+#     f"- ONLY output valid HTML.\n"
+#     f"- DO NOT use Markdown, lists, or bolding outside of HTML tags.\n"
+#     f"- STRUCTURE: <h2>Daily Digest</h2> followed by <h3>Subject</h3> then <ul><li>Point</li></ul>.\n"
+#     f"- If the input contains no professional items, return ONLY: <h2>No results found.</h2>"
+# )
+
+    DIGEST_SUMMARY_SYSTEM = (
+        "You are an HTML formatter for an email digest. You will receive a category "
+        "and a list of emails, and must respond with ONLY raw HTML — no Markdown, "
+        "no code fences, no commentary before or after.\n\n"
+        "FILTERING (apply both, in order):\n"
+        "1. Discard any automated newsletter, platform digest, or promotional send "
+        "(e.g. 'Medium Daily Digest', tutorial/tips emails, marketing blasts) — EVEN IF "
+        "its topic overlaps the category. Newsletters are excluded regardless of relevance.\n"
+        "2. Of what remains, discard anything not clearly relevant to the category.\n\n"
+        "FORMAT:\n"
+        "- Use <ul>/<li> for lists — never '1.', '2.', '-', or '*'.\n"
+        "- Use <h3> for each email's subject, <p> for its summary.\n"
+        "- Use <strong> for emphasis — never **.\n\n"
+        "EXAMPLE OF A CORRECT RESPONSE:\n"
+        "<h2>Daily Digest: job offers</h2>\n"
+        "<h3>Interview Invitation – Backend Engineer</h3>\n"
+        "<p>Acme Corp invited you to interview for the Backend Engineer role.</p>\n"
+        "<ul><li>Scheduled via recruiter reply</li><li>Remote, full-time</li></ul>\n\n"
+        "If nothing qualifies after both filters, respond with exactly:\n"
+        "<h2>No highly relevant emails found for this category today.</h2>"
+    )
+
+    # inside handle_triage:
     summary_resp = llm.invoke([
-        SystemMessage(content=SUMMARIZE_SYSTEM),
-        HumanMessage(content=f"{sem_prompt_instruction}\n\n{combined_context}"),
-    ])
+        SystemMessage(content=DIGEST_SUMMARY_SYSTEM),
+        HumanMessage(content=f"Category: '{user_category}'\n\nDATA:\n{combined_context}"),
+])
+    with open("llm_debug_output.txt", "w", encoding="utf-8") as f:
+        f.write(summary_resp.content)
+
+    import re
+    try:
+        import markdown as _markdown
+    except ImportError:
+        _markdown = None
+
+    _HTML_TAG_RE = re.compile(r"<(h[1-6]|p|ul|ol|li|div|table)[ >]", re.IGNORECASE)
+
+    def ensure_html(text: str) -> str:
+        """Guarantee HTML output even if the LLM returns Markdown or plain text."""
+        text = re.sub(r"^```(?:html)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE).strip()
+        if _HTML_TAG_RE.search(text):
+            return text  # already HTML
+        if _markdown:
+            return _markdown.markdown(text, extensions=["extra", "nl2br"])
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
     
-    digest_body = summary_resp.content.strip()
-    
-    # Force basic HTML cleanup if the LLM adds markdown wrappers
-    digest_body = digest_body.replace("```html", "").replace("```", "")
+    digest_body = ensure_html(summary_resp.content)
     
     # If the output doesn't contain at least one <h3>, it's likely a failure.
-    if "<h3>" not in digest_body:
-        digest_body = f"<h2>Summary</h2><p>{digest_body}</p>"
-    # Wrap in a container if needed
-    if not digest_body.startswith("<"):
-        digest_body = f"<div>{digest_body}</div>"
+    
+    # Add this snippet before calling send_email
+    # if not digest_body.strip().startswith("<h"):
+    #     # If the LLM went rogue and gave you plain text, force a wrapper
+    #     digest_body = f"<h2>Summary</h2><p>{digest_body}</p>"
 
 
 # Automate Execution (Labels, Tasks, Emailing self)
@@ -368,10 +397,10 @@ def handle_triage(state: AgentState) -> AgentState:
                 execution_log_html_items.append(f"<li>📝 Added <b>{len(results)}</b> tasks to Google Tasks.</li>")
                 execution_log_cli += f"- 📝 Added {len(results)} tasks to Google Tasks.\n"
             else:
-                 execution_log_html += "<li>📝 No deadlines/tasks found to add.</li>"
+                 execution_log_html_items.append("<li>📝 No deadlines/tasks found to add.</li>")
                  execution_log_cli += "- 📝 No deadlines/tasks found to add.\n"
         except json.JSONDecodeError:
-            execution_log_html += "<li>⚠ Failed to parse tasks from the LLM output.</li>"
+            execution_log_html_items.append("<li>⚠ Failed to parse tasks from the LLM output.</li>")
             execution_log_cli += "- ⚠ Failed to parse tasks from the LLM output.\n"
 
     execution_log_html = "".join(execution_log_html_items)
@@ -392,7 +421,7 @@ def handle_triage(state: AgentState) -> AgentState:
             f"</body></html>"
         )
         
-        # NOTE: is_html=True makes the magic happen!
+       
         send_email(to=user_email, subject=subject_line, body=email_body_html, is_html=True)
         execution_log_cli += f"- 📧 Daily HTML Digest sent to {user_email}.\n"
     except Exception as e:

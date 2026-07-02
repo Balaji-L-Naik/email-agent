@@ -174,7 +174,7 @@ Result: Queries your local vector database for 10 emails related to the concept 
 ---
 
 ### Project Structure
-
+```bash
 EMAIL-AGENT/
 ├── agent/
 │   ├── graph.py             # Main LangGraph state machine & logic
@@ -197,6 +197,7 @@ EMAIL-AGENT/
 ├── main.py                  # Entry point for the interactive chat CLI
 ├── requirements.txt
 └── .gitignore
+```
 
 ## Privacy Notice
 Your `credentials.json` and `token.pickle` grant direct access to your Gmail account. **Never commit these files to version control.** They are included in the `.gitignore` by default. All LLM reasoning is done entirely locally via Ollama.

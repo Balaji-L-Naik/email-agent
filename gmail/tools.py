@@ -119,27 +119,38 @@ from email.mime.base import MIMEBase
 from email import encoders
 from email.mime.text import MIMEText
 from email.charset import Charset, QP
+from email import encoders, charset
+import base64
+
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders, charset
+import base64
+import os
+import mimetypes
 
 def send_email(to: str, subject: str, body: str, attachments: list[str] = None, is_html: bool = False) -> str:
-    """
-    Send an email via the authenticated Gmail account, with optional attachments.
-    """
     service = _get_service()
+    
+    # 1. Setup UTF-8 and Quoted-Printable
+    cs = charset.Charset('utf-8')
+    cs.body_encoding = charset.QP 
+    
     mime_subtype = "html" if is_html else "plain"
-    # Create a Charset object for utf-8 and set encoding to quoted-printable
-    cs = Charset('utf-8')
-    cs.body_encoding = QP 
     
-    # Create the text object with the explicit charset
-    msg_text = MIMEText(body, mime_subtype, 'utf-8')
-    msg_text.set_charset(cs)
+    # 2. Use MIMEMultipart for EVERYTHING (cleaner than switching based on attachments)
+    msg = MIMEMultipart()
+    msg["to"] = to
+    msg["subject"] = subject
     
-    if not attachments:
-        mime = MIMEText(body,mime_subtype)
-    else:
-        mime = MIMEMultipart()
-        mime.attach(MIMEText(body,mime_subtype))
-        
+    # 3. Create the body and apply the charset configuration
+    body_part = MIMEText(body, mime_subtype, 'utf-8')
+    body_part.set_charset(cs)
+    msg.attach(body_part)
+    
+    # 4. Handle attachments (always attach to the 'msg' object)
+    if attachments:
         for file_path in attachments:
             if not os.path.exists(file_path):
                 continue
@@ -154,11 +165,10 @@ def send_email(to: str, subject: str, body: str, attachments: list[str] = None, 
             
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(file_path)}"')
-            mime.attach(part)
+            msg.attach(part)
             
-    mime["to"] = to
-    mime["subject"] = subject
-    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    # 5. Final raw conversion (using the properly configured 'msg' object)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
     try:
         sent = service.users().messages().send(
