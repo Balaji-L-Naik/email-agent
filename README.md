@@ -128,6 +128,10 @@ Note: Depending on the volume of your inbox, the initial sync may take a few min
 
 When to use it: For automated, background inbox management. This script is designed to be run as a cron job or scheduled task. It fetches emails matching your criteria, applies labels, extracts actionable tasks, and emails you a clean, compiled HTML digest of its actions.
 
+The digest email (rendered from `templates/digest.html`) includes:
+- **Agent actions** — a log of what the triage performed (labels applied, tasks added, etc.)
+- **Email cards** — for each matched email: the **subject**, **sender**, a one-sentence **AI summary**, and a direct **"Open in Gmail"** link (`https://mail.google.com/mail/u/0/#all/{message_id}`) to jump straight to the source message
+
 What happens: The script runs a single-pass LangGraph execution. It does not require user interaction. It processes the emails based on the flags you provide and immediately terminates upon completion.
 
 Command Structure:
@@ -189,6 +193,8 @@ EMAIL-AGENT/
 │   └── test_semantic.py     # Sandbox script to test vector retrieval
 ├── tasks/
 │   ├── tools.py             # Google Tasks API wrappers
+├── templates/
+│   └── digest.html          # Jinja2 HTML template for the daily triage digest email
 ├── utils/
 │   └── parser.py            # Attachment parsing (PDF, CSV, TXT)
 ├── vector/
