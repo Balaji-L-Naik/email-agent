@@ -5,7 +5,7 @@ A completely local-first, conversational AI email assistant built with **LangGra
 This agent runs directly from your terminal and allows you to manage your Gmail inbox using natural language. Because it uses a local LLM (Ollama), **none of your email contents are sent to third-party AI providers** like OpenAI or Anthropic — ensuring complete privacy.
 
 ---
-## 🎯 The Problem Statement & My Contributions
+##  The Problem Statement & My Contributions
 
 **The Modern Inbox Dilemma:** Standard email clients rely entirely on rigid, exact-keyword matching (lexical search) and require manual triage to stay organized. If you are looking for emails about "learning," a standard client will miss an email from Udemy titled "Masterclass on Python" because the exact keyword isn't present. Furthermore, actionable items and deadlines are frequently buried inside long threads, forcing context-switching between your inbox and your to-do lists.
 
