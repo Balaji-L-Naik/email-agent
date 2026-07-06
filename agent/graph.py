@@ -29,6 +29,15 @@ from tasks.tools import add_multiple_google_tasks
 
 # Upgraded to Llama 3.1!
 llm = ChatOllama(model="llama3.1", temperature=0)
+import os
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_DIR = os.path.join(os.path.dirname(current_dir), "templates")
+jinja_env = Environment(
+    loader=FileSystemLoader(TEMPLATE_DIR),
+    autoescape=select_autoescape(["html"]),  # escapes <, &, etc. in email subjects automatically
+)
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -285,56 +294,84 @@ def handle_triage(state: AgentState) -> AgentState:
 #     f"- STRUCTURE: <h2>Daily Digest</h2> followed by <h3>Subject</h3> then <ul><li>Point</li></ul>.\n"
 #     f"- If the input contains no professional items, return ONLY: <h2>No results found.</h2>"
 # )
-
+    # --- 3. SEMANTIC FILTERING & JSON SUMMARY ---
+   # --- 3. SEMANTIC FILTERING & JSON SUMMARY ---
     DIGEST_SUMMARY_SYSTEM = (
-        "You are an HTML formatter for an email digest. You will receive a category "
-        "and a list of emails, and must respond with ONLY raw HTML — no Markdown, "
-        "no code fences, no commentary before or after.\n\n"
-        "FILTERING (apply both, in order):\n"
-        "1. Discard any automated newsletter, platform digest, or promotional send "
-        "(e.g. 'Medium Daily Digest', tutorial/tips emails, marketing blasts) — EVEN IF "
-        "its topic overlaps the category. Newsletters are excluded regardless of relevance.\n"
-        "2. Of what remains, discard anything not clearly relevant to the category.\n\n"
-        "FORMAT:\n"
-        "- Use <ul>/<li> for lists — never '1.', '2.', '-', or '*'.\n"
-        "- Use <h3> for each email's subject, <p> for its summary.\n"
-        "- Use <strong> for emphasis — never **.\n\n"
-        "EXAMPLE OF A CORRECT RESPONSE:\n"
-        "<h2>Daily Digest: job offers</h2>\n"
-        "<h3>Interview Invitation – Backend Engineer</h3>\n"
-        "<p>Acme Corp invited you to interview for the Backend Engineer role.</p>\n"
-        "<ul><li>Scheduled via recruiter reply</li><li>Remote, full-time</li></ul>\n\n"
-        "If nothing qualifies after both filters, respond with exactly:\n"
-        "<h2>No highly relevant emails found for this category today.</h2>"
+        "You are a strict JSON data extraction API. You do not converse. You ONLY output valid JSON.\n\n"
+        "TASK:\n"
+        "1. Extract uniquely relevant emails based on the Category.\n"
+        "2. Write a 1-sentence summary for each email.\n"
+        "3. DO NOT duplicate emails. List each unique email only once.\n\n"
+        "REQUIRED JSON SCHEMA:\n"
+        "{\n"
+        '  "emails": [\n'
+        '    {"id": "...", "subject": "...", "sender": "...", "summary": "..."}\n'
+        "  ]\n"
+        "}"
     )
 
-    # inside handle_triage:
-    summary_resp = llm.invoke([
+    summary_resp = llm.bind(format="json").invoke([
         SystemMessage(content=DIGEST_SUMMARY_SYSTEM),
-        HumanMessage(content=f"Category: '{user_category}'\n\nDATA:\n{combined_context}"),
-])
-    with open("llm_debug_output.txt", "w", encoding="utf-8") as f:
-        f.write(summary_resp.content)
+        HumanMessage(content=f"Category: '{user_category}'\n\nEMAILS TO PROCESS:\n{combined_context}\n\nRETURN ONLY JSON:"),
+    ])
 
-    import re
+    # Clean the raw string
+    raw_summary_json = summary_resp.content.strip()
+    raw_summary_json = re.sub(r"^```(?:json)?\s*", "", raw_summary_json)
+    raw_summary_json = re.sub(r"\s*```$", "", raw_summary_json)
+
+    # Fallback to extract just the curly braces
+    match = re.search(r'\{.*\}', raw_summary_json, re.DOTALL)
+    if match:
+        raw_summary_json = match.group(0)
+
     try:
-        import markdown as _markdown
-    except ImportError:
-        _markdown = None
+        raw_emails = json.loads(raw_summary_json).get("emails", [])
+        
+        # --- DATA CLEANING & DEDUPLICATION ---
+        seen_subjects = set()
+        relevant_emails = []
+        
+        # Build a lookup from matched_emails by subject+sender for Gmail ID mapping
+        matched_lookup = {}
+        for me in matched_emails:
+            sub_key = me["subject"].lower().strip()
+            from_key = me["from_addr"].lower().strip()
+            matched_lookup[(sub_key, from_key)] = me["id"]
+            # Subject-only fallback in case sender format differs
+            if sub_key not in matched_lookup:
+                matched_lookup[sub_key] = me["id"]
+        
+        for em in raw_emails:
+            # Handle model hallucinating wrong keys
+            subject = em.get("subject") or em.get("title") or "No Subject"
+            sender = em.get("sender") or em.get("from") or "Unknown Sender"
+            summary = em.get("summary") or em.get("insight") or "No insight provided."
+            
+            clean_sub = subject.lower().strip()
+            clean_sender = sender.lower().strip()
+            # Deduplicate based on lowercase subject
+            if clean_sub not in seen_subjects and clean_sub != "no subject":
+                seen_subjects.add(clean_sub)
+                email_id = matched_lookup.get((clean_sub, clean_sender)) or matched_lookup.get(clean_sub) or ""
+                relevant_emails.append({
+                    "subject": subject,
+                    "sender": sender,
+                    "summary": summary,
+                    "id": email_id
+                })
+                
+    except json.JSONDecodeError:
+        print(f"DEBUG: Failed to parse LLM JSON output. Raw output:\n{summary_resp.content}")
+        relevant_emails = []
 
-    _HTML_TAG_RE = re.compile(r"<(h[1-6]|p|ul|ol|li|div|table)[ >]", re.IGNORECASE)
-
-    def ensure_html(text: str) -> str:
-        """Guarantee HTML output even if the LLM returns Markdown or plain text."""
-        text = re.sub(r"^```(?:html)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE).strip()
-        if _HTML_TAG_RE.search(text):
-            return text  # already HTML
-        if _markdown:
-            return _markdown.markdown(text, extensions=["extra", "nl2br"])
-        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
-    
-    digest_body = ensure_html(summary_resp.content)
+    def render_digest(user_category: str, relevant_emails: list[dict], execution_log: list[str]) -> str:
+        template = jinja_env.get_template("digest.html")
+        return template.render(
+            date=datetime.datetime.now().strftime("%B %d, %Y"),
+            execution_log=execution_log,
+            categories=[{"category_name": user_category, "emails": relevant_emails}],
+        )
     
     # If the output doesn't contain at least one <h3>, it's likely a failure.
     
@@ -345,10 +382,8 @@ def handle_triage(state: AgentState) -> AgentState:
 
 
 # Automate Execution (Labels, Tasks, Emailing self)
-    execution_log_html_items = []
+    execution_log_items = []
     execution_log_cli = f"✅ Triage complete! Processed {len(matched_emails)} emails.\n"
-    execution_log_html = ""
-
 
     # --- SMART LABEL LOGIC ---
     label_to_add = config.get("label_to_add")
@@ -356,12 +391,11 @@ def handle_triage(state: AgentState) -> AgentState:
         lbl_lower = label_to_add.lower()
         add_labels = []
         remove_labels = []
-        
-        # Translate conversational terms into correct Gmail API System IDs
+
         if "star" in lbl_lower: add_labels.append("STARRED")
         elif "imp" in lbl_lower: add_labels.append("IMPORTANT")
         elif "unread" in lbl_lower: add_labels.append("UNREAD")
-        elif "read" in lbl_lower: remove_labels.append("UNREAD") # Remove UNREAD to mark as Read!
+        elif "read" in lbl_lower: remove_labels.append("UNREAD")
         else: add_labels.append(label_to_add.upper())
 
         success_count = 0
@@ -372,11 +406,11 @@ def handle_triage(state: AgentState) -> AgentState:
                     success_count += 1
                 except Exception as e:
                     print(f"DEBUG: Failed to label email {em['id']}: {e}")
-            
+
             label_action_str = f"Applied '{label_to_add}' logic to {success_count} emails"
-            execution_log_html_items.append(f"<li>🏷️ {label_action_str}</li>")
+            execution_log_items.append(f"🏷️ {label_action_str}")
             execution_log_cli += f"- 🏷️ {label_action_str}.\n"
-        
+
     # Tasks
     if config.get("add_tasks"):
         current_time = datetime.datetime.now().isoformat() + "Z"
@@ -385,50 +419,40 @@ def handle_triage(state: AgentState) -> AgentState:
             SystemMessage(content=EXTRACT_TODO_SYSTEM),
             HumanMessage(content=task_prompt),
         ])
-        
+
         raw_task_json = task_resp.content.strip()
         raw_task_json = re.sub(r"```json\s*", "", raw_task_json)
         raw_task_json = re.sub(r"```\s*", "", raw_task_json).strip()
-        
+
         try:
             tasks_list = json.loads(raw_task_json)
             if isinstance(tasks_list, list) and tasks_list:
                 results = add_multiple_google_tasks(tasks_list)
-                execution_log_html_items.append(f"<li>📝 Added <b>{len(results)}</b> tasks to Google Tasks.</li>")
+                execution_log_items.append(f"📝 Added {len(results)} tasks to Google Tasks.")
                 execution_log_cli += f"- 📝 Added {len(results)} tasks to Google Tasks.\n"
             else:
-                 execution_log_html_items.append("<li>📝 No deadlines/tasks found to add.</li>")
-                 execution_log_cli += "- 📝 No deadlines/tasks found to add.\n"
+                execution_log_items.append("📝 No deadlines/tasks found to add.")
+                execution_log_cli += "- 📝 No deadlines/tasks found to add.\n"
         except json.JSONDecodeError:
-            execution_log_html_items.append("<li>⚠ Failed to parse tasks from the LLM output.</li>")
+            execution_log_items.append("⚠ Failed to parse tasks from the LLM output.")
             execution_log_cli += "- ⚠ Failed to parse tasks from the LLM output.\n"
 
-    execution_log_html = "".join(execution_log_html_items)
+        
 
 
-    # Email Digest to Self using HTML flag
+    email_body_html = render_digest(user_category, relevant_emails, execution_log_items)
+
     try:
         user_email = get_authenticated_email()
         if not user_email:
             raise Exception("Could not determine your authenticated email address.")
-        
         subject_line = f"Daily Agent Digest: {', '.join(keywords)}"
-        # Construct the final HTML body
-        email_body_html = (
-            f"<html><body>"
-            f"<h2>Agent Execution Log:</h2><ul>{execution_log_html}</ul>"
-            f"<hr><br>{digest_body}"
-            f"</body></html>"
-        )
-        
-       
         send_email(to=user_email, subject=subject_line, body=email_body_html, is_html=True)
         execution_log_cli += f"- 📧 Daily HTML Digest sent to {user_email}.\n"
     except Exception as e:
         execution_log_cli += f"- ⚠ Could not send digest email: {e}\n"
 
-    # Final response to CLI
-    final_response = f"{execution_log_cli}\n{'─' * 50}\n[bold]Digest Preview (HTML Source):[/bold]\n\n{digest_body}"
+    final_response = f"{execution_log_cli}\n{'─' * 50}\n[bold]Digest Preview (HTML Source):[/bold]\n\n{email_body_html}"
     
     return {
         **state,
