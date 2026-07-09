@@ -28,7 +28,7 @@ from tasks.tools import add_multiple_google_tasks
 
 
 # Upgraded to Llama 3.1!
-llm = ChatOllama(model="llama3.1", temperature=0)
+llm = ChatOllama(model="llama3.1", temperature=0, num_predict=2048)
 import os
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -251,7 +251,7 @@ def handle_triage(state: AgentState) -> AgentState:
         all_search_terms = list(set([k.lower() for k in keywords] + [w.lower() for w in expanded_words]))
         keyword_str = " OR ".join([f'"{k}"' for k in all_search_terms])
         
-        query = f"({keyword_str}) newer_than:{timeframe}"
+        query = f"({keyword_str}) in:inbox newer_than:{timeframe}"
         print(f"DEBUG: Expanded Categorical & Brand Query: {query}")
         
         try:
@@ -269,7 +269,7 @@ def handle_triage(state: AgentState) -> AgentState:
     for i, em in enumerate(matched_emails, 1):
         try:
             full = get_email_body(em["id"])
-            body_text = full['body'][:1000] # Truncate slightly to save context window
+            body_text = full['body'][:500] # Truncate to save context window
             parts.append(
                 f"<email_item index='{i}'>\n"
                 f"From: {full['from_addr']}\n"

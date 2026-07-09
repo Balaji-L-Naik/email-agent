@@ -32,7 +32,7 @@ def sync_recent_emails(max_emails=50):
     )
     
     print(f"📥 Fetching up to {max_emails} recent emails to sync...")
-    recent_emails = search_emails(query="newer_than:7d", max_results=max_emails)
+    recent_emails = search_emails(query="in:inbox newer_than:7d", max_results=max_emails)
     
     if not recent_emails:
         print("No recent emails found to sync.")

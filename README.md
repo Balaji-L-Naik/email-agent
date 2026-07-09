@@ -177,6 +177,42 @@ Result: Queries your local vector database for 10 emails related to the concept 
 
 ---
 
+### File-Based Triage (auto_triage_file.py)
+
+An alternative to `auto_triage.py` designed for cron jobs and scheduled tasks. Reads keywords from a `.txt` file and automatically runs `vector_sync` before every triage, keeping the semantic database current without manual intervention.
+
+#### File Format
+Create a plain text file with one keyword per line. Lines starting with `#` are ignored:
+```bash
+# internships.txt
+internship
+application
+offer
+remote
+```
+
+#### Usage (Cron-Ready)
+```bash
+python auto_triage_file.py --file internships.txt --label STARRED --tasks --time 7d --max 20
+```
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--file, -f` | String | **Required** | Path to the `.txt` keywords file |
+| `--label, -l` | String | None | Gmail label to apply (e.g., STARRED, IMPORTANT) |
+| `--tasks, -t` | Bool | False | Extract deadlines into Google Tasks |
+| `--time` | String | 1d | Search timeframe (1d, 7d, 1m) |
+| `--max` | Integer | 20 | Max emails to process |
+| `--semantic, -s` | Bool | False | Use vector DB for conceptual search |
+| `--skip-sync` | Bool | False | Skip the automatic vector DB sync at startup |
+
+The vector database is synced automatically on every run (unless `--skip-sync` is set), so you don't need to schedule `vector_sync.py` separately. Example cron job (daily at 7 AM):
+```bash
+0 7 * * * cd /path/to/email-agent && python auto_triage_file.py --file keywords.txt --tasks --time 1d
+```
+
+---
+
 ### Project Structure
 ```bash
 EMAIL-AGENT/
@@ -199,7 +235,8 @@ EMAIL-AGENT/
 │   └── parser.py            # Attachment parsing (PDF, CSV, TXT)
 ├── vector/
 │   ├── tools.py             # ChromaDB initialization and search queries
-├── auto_triage.py           # CLI script for automated batch jobs
+├── auto_triage.py           # CLI script for automated batch jobs (terminal keywords)
+├── auto_triage_file.py      # CLI script for automated batch jobs (keywords from .txt file)
 ├── main.py                  # Entry point for the interactive chat CLI
 ├── requirements.txt
 └── .gitignore
