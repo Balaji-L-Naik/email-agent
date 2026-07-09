@@ -206,10 +206,44 @@ python auto_triage_file.py --file internships.txt --label STARRED --tasks --time
 | `--semantic, -s` | Bool | False | Use vector DB for conceptual search |
 | `--skip-sync` | Bool | False | Skip the automatic vector DB sync at startup |
 
-The vector database is synced automatically on every run (unless `--skip-sync` is set), so you don't need to schedule `vector_sync.py` separately. Example cron job (daily at 7 AM):
-```bash
-0 7 * * * cd /path/to/email-agent && python auto_triage_file.py --file keywords.txt --tasks --time 1d
-```
+The vector database is synced automatically on every run (unless `--skip-sync` is set), so you don't need to schedule `vector_sync.py` separately.
+
+---
+
+### Windows Task Scheduler Automation (run_triage.ps1)
+
+A PowerShell wrapper script (`run_triage.ps1`) is included for Windows Task Scheduler. It handles the full pipeline — starting Ollama if needed, waiting for it to be ready, then running the triage.
+
+#### Script Behavior
+1. Checks if `ollama.exe` is running; if not, starts `ollama serve` in the background
+2. Polls `http://localhost:11434/api/tags` up to 30 seconds until Ollama responds
+3. Exits with code 1 if Ollama fails to start (triggers Task Scheduler retry)
+4. Runs `auto_triage_file.py` with your keyword file
+
+#### Setup Steps
+
+1. **Create your keywords file** — one keyword per line, `#` for comments:
+   ```bash
+   keywords.txt
+   ```
+2. **Open Task Scheduler** (<kbd>Win</kbd>+<kbd>R</kbd> → `taskschd.msc`)
+3. **Create Task** with these settings:
+
+   | Tab | Setting | Value |
+   |:---|:---|:---|
+   | **General** | Name | `Email Agent Daily Triage` |
+   | | Run whether user is logged on or not | ✅ |
+   | | Run with highest privileges | ✅ |
+   | **Triggers** | Daily at | `7:00 AM` (or your preferred time) |
+   | **Actions** | Program/script | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` |
+   | | Arguments | `-ExecutionPolicy Bypass -File "C:\path\to\email-agent\run_triage.ps1"` |
+   | | Start in | `C:\path\to\email-agent` |
+   | **Conditions** | Stop if on battery | ❌ (uncheck for laptops) |
+   | **Settings** | Restart on failure | Every 1 minute, up to 3 times |
+
+4. **Test** — right-click the task → **Run**, check the **History** tab for results.
+
+> **Note:** If Ollama is already set to start on login (default), the script detects it and skips the startup step.
 
 ---
 
@@ -237,6 +271,7 @@ EMAIL-AGENT/
 │   ├── tools.py             # ChromaDB initialization and search queries
 ├── auto_triage.py           # CLI script for automated batch jobs (terminal keywords)
 ├── auto_triage_file.py      # CLI script for automated batch jobs (keywords from .txt file)
+├── run_triage.ps1           # PowerShell wrapper for Windows Task Scheduler (starts Ollama + runs triage)
 ├── main.py                  # Entry point for the interactive chat CLI
 ├── requirements.txt
 └── .gitignore
